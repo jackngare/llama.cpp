@@ -86,6 +86,15 @@ bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return res;
 }
 
+bool llama_kv_cache_iswa::seq_pool(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) {
+    bool res = true;
+
+    res = res & kv_base->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+    res = res & kv_swa ->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+
+    return res;
+}
+
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_base->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_swa ->seq_cp(seq_id_src, seq_id_dst, p0, p1);
@@ -106,6 +115,21 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+int32_t llama_kv_cache_iswa::compact(uint32_t stream_id) {
+    // SWA requires identical physical indices between base and swa caches.
+    // We synchronize the caches by having kv_base generate the shift manifest,
+    // and then both caches apply the exact same physical tensor memmoves.
+    auto shifts = kv_base->get_compact_shifts(stream_id);
+    if (shifts.empty()) {
+        return get_used_max_p1(stream_id);
+    }
+
+    int32_t r1 = kv_base->apply_compact_shifts(stream_id, shifts);
+    int32_t r2 = kv_swa->apply_compact_shifts(stream_id, shifts);
+
+    return std::max(r1, r2);
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);
@@ -113,6 +137,14 @@ llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
 
 llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
+}
+
+int32_t llama_kv_cache_iswa::get_used_max_p1(uint32_t stream_id) const {
+    return std::max(kv_base->get_used_max_p1(stream_id), kv_swa->get_used_max_p1(stream_id));
+}
+
+int32_t llama_kv_cache_iswa::get_used_count(uint32_t stream_id) const {
+    return std::max(kv_base->get_used_count(stream_id), kv_swa->get_used_count(stream_id));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {

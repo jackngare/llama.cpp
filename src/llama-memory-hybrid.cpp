@@ -157,6 +157,13 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_recr->seq_keep(seq_id);
 }
 
+bool llama_memory_hybrid::seq_pool(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) {
+    bool res = true;
+    res &= mem_attn->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+    res &= mem_recr->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+    return res;
+}
+
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
@@ -167,6 +174,10 @@ void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
+int32_t llama_memory_hybrid::compact(uint32_t stream_id) {
+    return mem_attn->compact(stream_id);
+}
+
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
@@ -175,6 +186,14 @@ llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
 llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     // the max of the total cache is the min of the two caches' max values
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+}
+
+int32_t llama_memory_hybrid::get_used_max_p1(uint32_t stream_id) const {
+    return mem_attn->get_used_max_p1(stream_id);
+}
+
+int32_t llama_memory_hybrid::get_used_count(uint32_t stream_id) const {
+    return mem_attn->get_used_count(stream_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {

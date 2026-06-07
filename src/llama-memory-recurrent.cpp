@@ -232,6 +232,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     return true;
 }
 
+bool llama_memory_recurrent::seq_pool(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) {
+    // Recurrent memory does not support pooling yet
+    return true;
+}
+
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
         return;

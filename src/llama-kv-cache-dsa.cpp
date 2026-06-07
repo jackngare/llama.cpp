@@ -66,6 +66,15 @@ bool llama_kv_cache_dsa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     return res;
 }
 
+bool llama_kv_cache_dsa::seq_pool(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) {
+    bool res = true;
+
+    res = res & kv_mla->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+    res = res & kv_lid->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
+
+    return res;
+}
+
 void llama_kv_cache_dsa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     kv_mla->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, p0, p1);

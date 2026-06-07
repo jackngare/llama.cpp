@@ -132,6 +132,7 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_pool(llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -139,6 +140,9 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+
+    int32_t get_used_max_p1(uint32_t stream_id = 0) const override { return kv_used_max_p1(stream_id); }
+    int32_t get_used_count(uint32_t stream_id = 0) const override { return kv_used_count(stream_id); }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
@@ -212,6 +216,28 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // ── E3A Path-A: dense KV compaction after CSA pooling ────────────────────
+    // Moves every occupied cell in stream_id to the lowest contiguous slots
+    // [0..n_surviving) so that used_max_p1() == n_surviving and the GGML
+    // attention mul_mat operates on a truly compact tensor.
+    // Returns n_surviving, or -1 on error.
+    int32_t compact(uint32_t stream_id = 0);
+
+    // Synchronous ISWA compaction primitives
+    std::vector<std::pair<uint32_t, uint32_t>> get_compact_shifts(uint32_t stream_id = 0) const;
+    int32_t apply_compact_shifts(uint32_t stream_id, const std::vector<std::pair<uint32_t, uint32_t>> & shifts);
+
+    // Inline accessors for the public C-API (llama_kv_compact, etc.)
+    // These are members, so they can freely access private v_cells.
+    int32_t kv_used_max_p1(uint32_t stream_id = 0) const {
+        if (stream_id >= v_cells.size()) return -1;
+        return static_cast<int32_t>(v_cells[stream_id].used_max_p1());
+    }
+    int32_t kv_used_count(uint32_t stream_id = 0) const {
+        if (stream_id >= v_cells.size()) return -1;
+        return static_cast<int32_t>(v_cells[stream_id].get_used());
+    }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -282,6 +308,9 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
+    // Dense re-packing after CSA pooling (Path A sparse-attention fix) -- MOVED TO PUBLIC.
+    // Declaration removed from private section; see public section above.
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,
@@ -309,6 +338,23 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
+
+// ───────────────────────────────────────────────────────────────────────
+// E3A extension: public C API for dense KV compaction and stats.
+// Called from llama_jni_bridge.cpp via llama_get_memory(ctx).
+// ───────────────────────────────────────────────────────────────────────
+
+// Re-pack surviving KV cells to contiguous low indices after CSA pooling.
+// After this call, used_max_p1() == get_used() and the GGML attention kernel
+// operates on a truly compressed tensor rather than the full kv_size slice.
+// Returns the number of surviving cells, or -1 if not applicable.
+int32_t llama_kv_compact(struct llama_context * ctx);
+
+// Query current KV utilisation without modifying state.
+int32_t llama_kv_get_used_max_p1(llama_memory_t mem);
+int32_t llama_kv_get_used      (llama_memory_t mem);
+
+
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:

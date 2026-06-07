@@ -4,7 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
-
+#include "../ggml/src/ggml-quants.h"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -407,6 +407,281 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     return true;
+}
+
+bool llama_kv_cache::seq_pool(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int factor, int attn_sink_guard) {
+    fprintf(stderr, "[E3A] DeepSeek V4 Compressed Sparse Attention (CSA) invoked for pos [%d, %d] with factor %d\n", p0, p1, factor);
+    
+    if (factor <= 1) return true;
+    if (p0 < 0) p0 = 0;
+    if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
+
+    // Fix 3: Attention Sink Protection (StreamingLLM, 2023).
+    // Positions 0-(attn_sink_guard-1) are the "attention sinks" and system prompts.
+    // Pooling these destroys attention pattern stability. Always skip them.
+    if (p0 < attn_sink_guard) {
+        p0 = attn_sink_guard;
+    }
+    if (p0 >= p1) {
+        fprintf(stderr, "[E3A] CSA skipped: range [%d, %d] is within attention sink guard.\n", p0, p1);
+        return true;
+    }
+
+    int removed = 0;
+    int pooled  = 0;
+
+    // Guard: after llama_memory_clear(), seq_to_stream may be empty or seq_id=-1
+    // (broadcast wildcard) maps to UINT64_MAX — both cause bitset::test out-of-range crash.
+    // If the sequence is out of range, the cache is empty — nothing to pool.
+    if (seq_id < 0 || static_cast<size_t>(seq_id) >= seq_to_stream.size()) {
+        fprintf(stderr, "[E3A] CSA skipped: seq_id=%d out of range (cache cleared or empty).\n", seq_id);
+        return true;
+    }
+    uint32_t s = seq_to_stream[static_cast<size_t>(seq_id)];
+
+    llama_pos max_pos = v_cells[s].seq_pos_max(seq_id);
+    llama_pos sliding_window_guard = max_pos - 256;
+
+    // Collect all cell indices in [p0, p1) belonging to this sequence, sorted by position.
+    std::vector<uint32_t> pool_indices;
+    pool_indices.reserve(p1 - p0);
+    for (uint32_t i = 0; i < v_cells[s].size(); ++i) {
+        if (v_cells[s].seq_has(i, seq_id) && v_cells[s].pos_in(i, p0, p1)) {
+            // Local window protection: do not compress the most recent 256 tokens
+            if (v_cells[s].pos_get(i) >= sliding_window_guard) continue;
+            pool_indices.push_back(i);
+        }
+    }
+
+    // Sort pool_indices by actual token position
+    std::sort(pool_indices.begin(), pool_indices.end(), [&](uint32_t a, uint32_t b) {
+        return v_cells[s].pos_get(a) < v_cells[s].pos_get(b);
+    });
+
+    struct CellNorm {
+        uint32_t cell;
+        float norm;
+    };
+    std::vector<CellNorm> cell_norms;
+    cell_norms.reserve(pool_indices.size());
+
+    // Pre-allocate scratch buffers once, sized to the max embedding dim across
+    // all layers, and reuse for every group and layer — eliminates hot-loop heap churn.
+    int64_t max_k_embd = 0;
+    for (auto & layer : layers) {
+        if (layer.k) max_k_embd = std::max(max_k_embd, layer.k->ne[0]);
+    }
+    std::vector<float> tmp_buf(max_k_embd, 0.0f);
+
+    // 1. Calculate L2 Norm for all unprotected tokens
+    for (uint32_t cell : pool_indices) {
+        float max_sq = 0.0f;
+        for (auto & layer : layers) {
+            if (layer.k) {
+                int64_t n_embd = layer.k->ne[0];
+                uint8_t * src_data = (uint8_t *)layer.k->data
+                                   + (size_t)s        * layer.k->nb[2]
+                                   + (size_t)cell     * layer.k->nb[1];
+
+                if (layer.k->type == GGML_TYPE_Q4_0) {
+                    dequantize_row_q4_0((const block_q4_0 *)src_data, tmp_buf.data(), n_embd);
+                } else if (layer.k->type == GGML_TYPE_F16) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *)src_data, tmp_buf.data(), n_embd);
+                } else if (layer.k->type == GGML_TYPE_F32) {
+                    memcpy(tmp_buf.data(), src_data, n_embd * sizeof(float));
+                } else {
+                    continue;
+                }
+
+                float layer_sq = 0.0f;
+                for (int64_t e = 0; e < n_embd; e++) {
+                    layer_sq += tmp_buf[e] * tmp_buf[e];
+                }
+
+                // ALSO process Values
+                if (layer.v) {
+                    int64_t n_embd_v = layer.v->ne[0];
+                    uint8_t * src_data_v = (uint8_t *)layer.v->data
+                                       + (size_t)s        * layer.v->nb[2]
+                                       + (size_t)cell     * layer.v->nb[1];
+
+                    if (layer.v->type == GGML_TYPE_Q4_0) {
+                        dequantize_row_q4_0((const block_q4_0 *)src_data_v, tmp_buf.data(), n_embd_v);
+                    } else if (layer.v->type == GGML_TYPE_F16) {
+                        ggml_fp16_to_fp32_row((const ggml_fp16_t *)src_data_v, tmp_buf.data(), n_embd_v);
+                    } else if (layer.v->type == GGML_TYPE_F32) {
+                        memcpy(tmp_buf.data(), src_data_v, n_embd_v * sizeof(float));
+                    }
+                    
+                    for (int64_t e = 0; e < n_embd_v; e++) {
+                        layer_sq += tmp_buf[e] * tmp_buf[e];
+                    }
+                }
+
+                max_sq = std::max(max_sq, layer_sq);
+            }
+        }
+        cell_norms.push_back({cell, max_sq});
+    }
+
+    // 2. Sort by highest magnitude (Heavy Hitters first)
+    std::sort(cell_norms.begin(), cell_norms.end(), [](const CellNorm& a, const CellNorm& b) {
+        return a.norm > b.norm;
+    });
+
+    // 3. Keep the top 1/factor tokens, and evict the rest globally!
+    size_t keep_count = cell_norms.size() / factor;
+    if (keep_count == 0 && !cell_norms.empty()) keep_count = 1;
+
+    for (size_t i = keep_count; i < cell_norms.size(); i++) {
+        v_cells[s].seq_rm(cell_norms[i].cell, seq_id);
+        removed++;
+    }
+    pooled = keep_count;
+
+    fprintf(stderr, "[E3A] CSA complete: pooled=%d groups, evicted=%d tokens, %d positions sink-protected.\n",
+            pooled, removed, attn_sink_guard);
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// llama_kv_compact — dense re-packing of KV cache cells after CSA pooling.
+//
+// How it works
+// ────────────
+// After seq_pool(), the surviving cells sit at SCATTERED physical positions
+// (e.g. 0..63, 64, 68, 72, …, 1796, 1765..1796).  used_max_p1() == ~1797.
+// The GGML attention kernel builds:
+//   K view: [n_embd_head, n_head, ~1797, ns]   stride between rows = kv_size
+// …and iterates ~1797 positions even though only ~531 are occupied.
+//
+// This function compacts them to [0, 1, 2, …, n_surviving-1] so that
+// used_max_p1() == n_surviving and the attention slice is truly dense.
+//
+// Algorithm (single stream, seq_id=0)
+// ────────────────────────────────────
+//  dst = 0
+//  for each src in v_cells[s].used (ascending, naturally ordered by std::set):
+//      if src == dst: dst++; continue   ← already in place
+//      for each layer:
+//          memcpy K[dst_row] ← K[src_row]   (raw quantised bytes, any type)
+//          memcpy V[dst_row] ← V[src_row]
+//      v_cells[s].mv(src, dst)               ← updates pos/seq/shift/used
+//      dst++
+//
+// Return value: n_surviving (== new used_max_p1), or -1 if not applicable.
+//
+// Safety notes
+// ─────────────
+// • We iterate a COPY of the used-set (snapshot before the loop) so that
+//   mv() mutations don't invalidate our iterator.
+// • dst < src always holds (we only move cells backward), so the copy never
+//   overwrites src before src has been moved.
+// • If both K and V are transposed V is still moved — the raw bytes are
+//   identical regardless of logical orientation; the shape metadata lives in
+//   the ggml_tensor struct which is NOT touched here.
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<std::pair<uint32_t, uint32_t>> llama_kv_cache::get_compact_shifts(uint32_t stream_id) const {
+    std::vector<std::pair<uint32_t, uint32_t>> shifts;
+    if (stream_id >= v_cells.size()) return shifts;
+
+    const auto & cells = v_cells[stream_id];
+    std::vector<uint32_t> occupied(cells.get_used_snapshot());
+    if (occupied.empty()) return shifts;
+
+    uint32_t dst = 0;
+    for (uint32_t src : occupied) {
+        if (src != dst) {
+            shifts.push_back({src, dst});
+        }
+        dst++;
+    }
+    return shifts;
+}
+
+int32_t llama_kv_cache::apply_compact_shifts(uint32_t stream_id, const std::vector<std::pair<uint32_t, uint32_t>> & shifts) {
+    if (stream_id >= v_cells.size()) return -1;
+    auto & cells = v_cells[stream_id];
+
+    for (const auto & shift : shifts) {
+        uint32_t src = shift.first;
+        uint32_t dst = shift.second;
+
+        // ── Move tensor data for every layer ─────────────────────────────────
+        for (auto & layer : layers) {
+            if (layer.k && layer.k->data) {
+                const size_t row_bytes = layer.k->nb[1];
+                uint8_t * src_ptr = static_cast<uint8_t *>(layer.k->data)
+                                  + (size_t)stream_id * layer.k->nb[2]
+                                  + (size_t)src * row_bytes;
+                uint8_t * dst_ptr = static_cast<uint8_t *>(layer.k->data)
+                                  + (size_t)stream_id * layer.k->nb[2]
+                                  + (size_t)dst * row_bytes;
+                memmove(dst_ptr, src_ptr, row_bytes);
+            }
+
+            if (layer.v && layer.v->data) {
+                const size_t row_bytes = layer.v->nb[1];
+                uint8_t * src_ptr = static_cast<uint8_t *>(layer.v->data)
+                                  + (size_t)stream_id * layer.v->nb[2]
+                                  + (size_t)src * row_bytes;
+                uint8_t * dst_ptr = static_cast<uint8_t *>(layer.v->data)
+                                  + (size_t)stream_id * layer.v->nb[2]
+                                  + (size_t)dst * row_bytes;
+                memmove(dst_ptr, src_ptr, row_bytes);
+            }
+        }
+
+        // ── Update cell metadata ──
+        cells.mv(src, dst);
+    }
+
+    return static_cast<int32_t>(cells.used_max_p1());
+}
+
+int32_t llama_kv_cache::compact(uint32_t stream_id) {
+    auto shifts = get_compact_shifts(stream_id);
+    if (shifts.empty()) {
+        if (stream_id >= v_cells.size()) return -1;
+        return static_cast<int32_t>(v_cells[stream_id].used_max_p1());
+    }
+    
+    int32_t n_surviving = apply_compact_shifts(stream_id, shifts);
+    fprintf(stderr, "[E3A] KV compact: %u cells re-packed to [0..%u), used_max_p1 now %u\n",
+            n_surviving, n_surviving, n_surviving);
+    return n_surviving;
+}
+
+// Public C API wrapper called from JNI
+int32_t llama_kv_compact(struct llama_context * ctx) {
+    fprintf(stderr, "[E3A] llama_kv_compact called.\n");
+    if (!ctx) {
+        fprintf(stderr, "[E3A] ctx is null\n");
+        return -1;
+    }
+    llama_memory_t mem = llama_get_memory(ctx);
+    if (!mem) {
+        fprintf(stderr, "[E3A] mem is null\n");
+        return -1;
+    }
+
+
+    int32_t res = mem->compact(/*stream_id=*/0);
+    fprintf(stderr, "[E3A] compact returned %d\n", res);
+    return res;
+}
+
+// Thin accessors for the KV stats JNI function.
+// Use the public kv_used_max_p1() / kv_used_count() inline methods so we
+// do not need to access private v_cells from outside the class.
+int32_t llama_kv_get_used_max_p1(llama_memory_t mem) {
+    if (!mem) return -1;
+    return mem->get_used_max_p1(/*stream_id=*/0);
+}
+
+int32_t llama_kv_get_used(llama_memory_t mem) {
+    if (!mem) return -1;
+    return mem->get_used_count(/*stream_id=*/0);
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

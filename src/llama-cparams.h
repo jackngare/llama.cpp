@@ -43,6 +43,10 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    bool e3a_enable_routing;
+    int32_t e3a_window_size;
+    float e3a_sparsity_budget;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

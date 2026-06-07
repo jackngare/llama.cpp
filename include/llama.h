@@ -387,6 +387,11 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // [E3A] Edge Runtime KV Compress scaffolding
+        bool     e3a_enable_routing;
+        int32_t  e3a_window_size;
+        float    e3a_sparsity_budget;
     };
 
     struct llama_model_tensor_override {
@@ -714,6 +719,15 @@ extern "C" {
               llama_seq_id seq_id,
                  llama_pos p0,
                  llama_pos p1);
+
+    // Pools tokens in the specified sequence and position range using DeepSeek V4 CSA strategy
+    // Replaces every 'factor' tokens with their mean-pooled representation and shifts remaining tokens
+    LLAMA_API bool llama_memory_seq_pool(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1,
+                       int factor, int attn_sink_guard);
 
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]

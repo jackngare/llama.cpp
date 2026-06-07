@@ -185,6 +185,10 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.e3a_enable_routing = params.e3a_enable_routing;
+    cparams.e3a_window_size = params.e3a_window_size;
+    cparams.e3a_sparsity_budget = params.e3a_sparsity_budget;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -3366,6 +3370,9 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.e3a_enable_routing          =*/ false,
+        /*.e3a_window_size             =*/ 0,
+        /*.e3a_sparsity_budget         =*/ 0.0f,
     };
 
     return result;
@@ -3713,6 +3720,19 @@ bool llama_memory_seq_rm(
     }
 
     return mem->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_seq_pool(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+                   int factor, int attn_sink_guard) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_pool(seq_id, p0, p1, factor, attn_sink_guard);
 }
 
 void llama_memory_seq_cp(

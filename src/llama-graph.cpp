@@ -2305,11 +2305,44 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask();
+    const auto & kq_mask_ref = inp->get_kq_mask();
+    ggml_tensor * kq_mask = kq_mask_ref;
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // [E3A] KV Cache Compression Hooks
+    if (k && v && kq_mask) {
+        int64_t n_kv = k->ne[2];
+        int64_t target_w = n_kv;
+
+        // 1. Heterogeneous Layer Routing (Slicing on middle layers)
+        if (cparams.e3a_enable_routing && cparams.e3a_window_size > 0 && il > 0 && il < hparams.n_layer - 1) {
+            if (cparams.e3a_window_size < target_w) {
+                target_w = cparams.e3a_window_size;
+            }
+        }
+
+        // 2. Dynamic Memory Sparsification (Budget-based simulated eviction)
+        if (cparams.e3a_sparsity_budget > 0.0f && cparams.e3a_sparsity_budget < 1.0f) {
+            int64_t budget_w = (int64_t)(n_kv * cparams.e3a_sparsity_budget);
+            if (budget_w < target_w) {
+                target_w = budget_w;
+            }
+        }
+
+        // Apply Slicing if target window is smaller than current KV context
+        if (target_w < n_kv && target_w > 0) {
+            size_t off_k = (n_kv - target_w) * k->nb[2];
+            size_t off_v = (n_kv - target_w) * v->nb[2];
+            size_t off_m = (n_kv - target_w) * kq_mask->nb[0];
+
+            k = ggml_view_4d(ctx0, k, k->ne[0], k->ne[1], target_w, k->ne[3], k->nb[1], k->nb[2], k->nb[3], off_k);
+            v = ggml_view_4d(ctx0, v, v->ne[0], v->ne[1], target_w, v->ne[3], v->nb[1], v->nb[2], v->nb[3], off_v);
+            kq_mask = ggml_view_4d(ctx0, kq_mask, target_w, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3], kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], off_m);
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

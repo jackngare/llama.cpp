@@ -97,24 +97,27 @@ public:
     }
 
     // move cell isrc to idst (used during defrag)
-    //void mv(uint32_t isrc, uint32_t idst) {
-    //    assert(isrc < pos.size());
-    //    assert(idst < pos.size());
+    // move cell isrc to idst (used during perfect defrag)
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
 
-    //    assert(pos[idst] == -1);
-    //    assert(pos[isrc] != -1);
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
 
-    //    pos  [idst] = pos  [isrc];
-    //    shift[idst] = shift[isrc];
-    //    seq  [idst] = seq  [isrc];
+        pos  [idst] = pos  [isrc];
+        ext  [idst] = ext  [isrc];
+        shift[idst] = shift[isrc];
+        seq  [idst] = seq  [isrc];
 
-    //    pos  [isrc] = -1;
-    //    shift[isrc] =  0;
-    //    seq  [isrc].reset();
+        pos  [isrc] = -1;
+        ext  [isrc].reset();
+        shift[isrc] =  0;
+        seq  [isrc].reset();
 
-    //    used.erase (isrc);
-    //    used.insert(idst);
-    //}
+        used.erase (isrc);
+        used.insert(idst);
+    }
 
     // copy the state of cells [i, i + n) (used for save/restore the state of the cells)
     llama_kv_cells cp(uint32_t i, uint32_t n) const {
@@ -453,6 +456,13 @@ public:
         seq_pos_add(i);
 
         has_shift = true;
+    }
+
+    // Returns a snapshot (copy) of the used-cell index set in ascending order.
+    // Used by llama_kv_cache::compact() to iterate occupied cells without
+    // directly accessing the private `used` member from outside this class.
+    std::vector<uint32_t> get_used_snapshot() const {
+        return std::vector<uint32_t>(used.begin(), used.end());
     }
 
 private:
